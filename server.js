@@ -7,32 +7,42 @@ app.use(express.json({ limit: "50mb" }));
 
 // ============ 配置 ============
 const ZO_API = "https://api.zo.computer";
-const ZO_ORIGIN = "https://rustydaisy.zo.computer";
 
 // 默认系统提示词
 const DEFAULT_SYSTEM_PROMPT = "你通过代理服务器运行，所有工具调用都在用户本地系统上执行，而非远程沙箱。请根据工具返回的实际结果来判断环境。";
 
 // ============ Token 管理 ============
-// 支持多 token 负载均衡，402 错误自动禁用
-let tokens = [];
+// 支持多 token 负载均衡，每个 token 对应不同域名
+let tokenConfigs = [];
 try {
-  const tokenStr = process.env.ZO_ACCESS_TOKENS || process.env.ZO_ACCESS_TOKEN || "[]";
-  tokens = JSON.parse(tokenStr);
-  // 兼容单个 token 字符串
-  if (typeof tokens === "string") tokens = [tokens];
-  if (!Array.isArray(tokens)) tokens = [];
+  const tokenStr = process.env.ZO_TOKENS || "[]";
+  tokenConfigs = JSON.parse(tokenStr);
+  if (!Array.isArray(tokenConfigs)) tokenConfigs = [];
 } catch {
-  // 兼容逗号分隔格式
-  const tokenStr = process.env.ZO_ACCESS_TOKENS || process.env.ZO_ACCESS_TOKEN || "";
-  tokens = tokenStr.split(",").map(t => t.trim()).filter(Boolean);
+  tokenConfigs = [];
 }
 
-const tokenPool = tokens.map((token, i) => ({
-  token,
+// 兼容旧格式 ZO_ACCESS_TOKENS
+if (tokenConfigs.length === 0) {
+  try {
+    const oldTokenStr = process.env.ZO_ACCESS_TOKENS || process.env.ZO_ACCESS_TOKEN || "[]";
+    const oldTokens = JSON.parse(oldTokenStr);
+    const tokens = Array.isArray(oldTokens) ? oldTokens : [oldTokens];
+    tokenConfigs = tokens.map(t => ({ token: t, origin: "https://rustydaisy.zo.computer" }));
+  } catch {
+    const oldTokenStr = process.env.ZO_ACCESS_TOKENS || process.env.ZO_ACCESS_TOKEN || "";
+    tokenConfigs = oldTokenStr.split(",").map(t => t.trim()).filter(Boolean)
+      .map(t => ({ token: t, origin: "https://rustydaisy.zo.computer" }));
+  }
+}
+
+const tokenPool = tokenConfigs.map((config, i) => ({
+  token: config.token,
+  origin: config.origin || "https://rustydaisy.zo.computer",
   index: i,
-  exhausted: false,      // 402 错误后标记为额度用完
-  exhaustedAt: null,      // 标记时间
-  failCount: 0,           // 连续失败次数
+  exhausted: false,
+  exhaustedAt: null,
+  failCount: 0,
 }));
 
 let currentTokenIndex = 0; // 轮询索引
@@ -98,14 +108,15 @@ let modelInfoMap = {};
 let refreshPromise = null;
 
 function zoHeaders(tokenObj) {
+  const origin = tokenObj.origin;
   return {
     "Content-Type": "application/json",
     "Cookie": `access_token=${tokenObj.token}`,
     "X-Zo-Streaming-Version": "2",
-    "X-Zo-Workspace-Origin": ZO_ORIGIN,
+    "X-Zo-Workspace-Origin": origin,
     "Idempotency-Key": crypto.randomUUID(),
-    "Origin": ZO_ORIGIN,
-    "Referer": `${ZO_ORIGIN}/`,
+    "Origin": origin,
+    "Referer": `${origin}/`,
   };
 }
 
@@ -139,12 +150,13 @@ async function refreshModels() {
   refreshPromise = (async () => {
     try {
       const tokenObj = getNextToken();
+      const origin = tokenObj.origin;
       const resp = await fetch(`${ZO_API}/models/available`, {
         headers: {
           "Cookie": `access_token=${tokenObj.token}`,
-          "X-Zo-Workspace-Origin": ZO_ORIGIN,
-          "Origin": ZO_ORIGIN,
-          "Referer": `${ZO_ORIGIN}/`,
+          "X-Zo-Workspace-Origin": origin,
+          "Origin": origin,
+          "Referer": `${origin}/`,
         },
       });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
