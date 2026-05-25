@@ -157,6 +157,7 @@ async function refreshModels() {
     try {
       const tokenObj = getNextToken();
       const origin = tokenObj.origin;
+      console.log(`[models] Fetching from ${ZO_API}/models/available with origin ${origin}`);
       const resp = await fetch(`${ZO_API}/models/available`, {
         headers: {
           "Cookie": `access_token=${tokenObj.token}`,
@@ -936,14 +937,28 @@ app.get("/health", (req, res) => {
 // ============ 启动 ============
 const PORT = process.env.PORT || config.port || 3000;
 app.listen(PORT, async () => {
-  await refreshModels(); // 启动时预加载模型列表
+  console.log(`ZO Proxy starting on http://localhost:${PORT}`);
+  console.log(`Tokens: ${tokenPool.length} loaded, ${tokenPool.filter(t => !t.exhausted).length} available`);
+
+  // 重试加载模型（最多 3 次）
+  for (let i = 0; i < 3; i++) {
+    try {
+      await refreshModels();
+      if (cachedModels && cachedModels.length > 0) break;
+    } catch (e) {
+      console.log(`[models] Attempt ${i + 1} failed, retrying...`);
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+
   console.log(`ZO Proxy running on http://localhost:${PORT}`);
   console.log(`  OpenAI:    POST http://localhost:${PORT}/v1/chat/completions`);
   console.log(`  Anthropic: POST http://localhost:${PORT}/v1/messages`);
   console.log(`  Models:    GET  http://localhost:${PORT}/v1/models`);
-  console.log(`Tokens: ${tokenPool.length} loaded, ${tokenPool.filter(t => !t.exhausted).length} available`);
-  if (tokenPool.length > 0) {
+  if (cachedModels && cachedModels.length > 0) {
     console.log(`Available: ${Object.keys(shortNameMap).join(", ")}`);
-    console.log(`Free models: ${cachedModels?.filter(m => m.type === "free").map(m => toShortName(m.model_name)).join(", ")}`);
+    console.log(`Free models: ${cachedModels.filter(m => m.type === "free").map(m => toShortName(m.model_name)).join(", ")}`);
+  } else {
+    console.log(`Models: Failed to load (will retry on first request)`);
   }
 });
