@@ -374,10 +374,14 @@ app.post("/v1/chat/completions", async (req, res) => {
 
   // 获取 token 并发送请求（支持 402 自动切换）
   let tokenObj = getNextToken();
-  const maxRetries = tokenPool.filter(t => !t.exhausted).length;
+  const availableTokens = tokenPool.filter(t => !t.exhausted);
+
+  if (availableTokens.length === 0) {
+    return res.status(402).json({ error: "All tokens exhausted" });
+  }
 
   let resp;
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
+  for (let attempt = 0; attempt < availableTokens.length; attempt++) {
     try {
       console.log(`[request] Using token #${tokenObj.index}, attempt ${attempt + 1}`);
       resp = await fetch(`${ZO_API}/ask`, {
@@ -390,7 +394,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       if (resp.status === 402) {
         markTokenExhausted(tokenObj);
         const nextToken = getNextToken();
-        if (nextToken.index === tokenObj.index) {
+        if (nextToken.index === tokenObj.index || nextToken.exhausted) {
           const err = await resp.text();
           return res.status(402).json({ error: "All tokens exhausted", detail: err });
         }
@@ -408,12 +412,17 @@ app.post("/v1/chat/completions", async (req, res) => {
       break;
     } catch (err) {
       markTokenFailed(tokenObj);
-      if (attempt === maxRetries - 1) {
+      if (attempt === availableTokens.length - 1) {
         console.error("ZO API error:", err);
         return res.status(500).json({ error: err.message });
       }
       tokenObj = getNextToken();
     }
+  }
+
+  // 确保 resp 存在
+  if (!resp) {
+    return res.status(500).json({ error: "No response from ZO API" });
   }
 
   try {
@@ -602,10 +611,14 @@ app.post("/v1/messages", async (req, res) => {
 
   // 获取 token 并发送请求（支持 402 自动切换）
   let tokenObj = getNextToken();
-  const maxRetries = tokenPool.filter(t => !t.exhausted).length;
+  const availableTokens = tokenPool.filter(t => !t.exhausted);
+
+  if (availableTokens.length === 0) {
+    return res.status(402).json({ type: "error", error: { message: "All tokens exhausted" } });
+  }
 
   let resp;
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
+  for (let attempt = 0; attempt < availableTokens.length; attempt++) {
     try {
       console.log(`[request] Using token #${tokenObj.index}, attempt ${attempt + 1}`);
       resp = await fetch(`${ZO_API}/ask`, {
@@ -618,7 +631,7 @@ app.post("/v1/messages", async (req, res) => {
       if (resp.status === 402) {
         markTokenExhausted(tokenObj);
         const nextToken = getNextToken();
-        if (nextToken.index === tokenObj.index) {
+        if (nextToken.index === tokenObj.index || nextToken.exhausted) {
           const err = await resp.text();
           return res.status(402).json({ type: "error", error: { message: "All tokens exhausted", detail: err } });
         }
@@ -636,12 +649,17 @@ app.post("/v1/messages", async (req, res) => {
       break;
     } catch (err) {
       markTokenFailed(tokenObj);
-      if (attempt === maxRetries - 1) {
+      if (attempt === availableTokens.length - 1) {
         console.error("ZO API error:", err);
         return res.status(500).json({ type: "error", error: { message: err.message } });
       }
       tokenObj = getNextToken();
     }
+  }
+
+  // 确保 resp 存在
+  if (!resp) {
+    return res.status(500).json({ type: "error", error: { message: "No response from ZO API" } });
   }
 
   try {
