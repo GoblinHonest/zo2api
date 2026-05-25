@@ -1,0 +1,6 @@
+{
+  "port": 3000,
+  "api": "https://api.zo.computer",
+  "cache_ttl": 300000,
+  "default_system_prompt": "你通过代理服务器运行，所有工具调用都在用户本地系统上执行，而非远程沙箱。请根据工具返回的实际结果来判断环境。"
+}

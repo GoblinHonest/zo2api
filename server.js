@@ -1,40 +1,43 @@
 import "dotenv/config";
 import express from "express";
 import crypto from "crypto";
+import { readFileSync, existsSync } from "fs";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
 
-// ============ 配置 ============
-const ZO_API = "https://api.zo.computer";
-
-// 默认系统提示词
-const DEFAULT_SYSTEM_PROMPT = "你通过代理服务器运行，所有工具调用都在用户本地系统上执行，而非远程沙箱。请根据工具返回的实际结果来判断环境。";
-
-// ============ Token 管理 ============
-// 支持多 token 负载均衡，每个 token 对应不同域名
-let tokenConfigs = [];
-try {
-  const tokenStr = process.env.ZO_TOKENS || "[]";
-  tokenConfigs = JSON.parse(tokenStr);
-  if (!Array.isArray(tokenConfigs)) tokenConfigs = [];
-} catch {
-  tokenConfigs = [];
-}
-
-// 兼容旧格式 ZO_ACCESS_TOKENS
-if (tokenConfigs.length === 0) {
+// ============ 配置文件 ============
+function loadJson(filename, fallback) {
+  const filepath = join(__dirname, filename);
+  if (!existsSync(filepath)) {
+    console.log(`[config] ${filename} not found, using defaults`);
+    return fallback;
+  }
   try {
-    const oldTokenStr = process.env.ZO_ACCESS_TOKENS || process.env.ZO_ACCESS_TOKEN || "[]";
-    const oldTokens = JSON.parse(oldTokenStr);
-    const tokens = Array.isArray(oldTokens) ? oldTokens : [oldTokens];
-    tokenConfigs = tokens.map(t => ({ token: t, origin: "https://rustydaisy.zo.computer" }));
-  } catch {
-    const oldTokenStr = process.env.ZO_ACCESS_TOKENS || process.env.ZO_ACCESS_TOKEN || "";
-    tokenConfigs = oldTokenStr.split(",").map(t => t.trim()).filter(Boolean)
-      .map(t => ({ token: t, origin: "https://rustydaisy.zo.computer" }));
+    return JSON.parse(readFileSync(filepath, "utf8"));
+  } catch (e) {
+    console.error(`[config] Failed to parse ${filename}:`, e.message);
+    return fallback;
   }
 }
+
+const config = loadJson("config.json", {
+  port: 3000,
+  api: "https://api.zo.computer",
+  cache_ttl: 300000,
+  default_system_prompt: "你通过代理服务器运行，所有工具调用都在用户本地系统上执行，而非远程沙箱。请根据工具返回的实际结果来判断环境。",
+});
+
+const ZO_API = config.api;
+const CACHE_TTL = config.cache_ttl;
+const DEFAULT_SYSTEM_PROMPT = config.default_system_prompt;
+
+// ============ Token 管理 ============
+const tokenConfigs = loadJson("account.json", []);
 
 const tokenPool = tokenConfigs.map((config, i) => ({
   token: config.token,
@@ -44,6 +47,10 @@ const tokenPool = tokenConfigs.map((config, i) => ({
   exhaustedAt: null,
   failCount: 0,
 }));
+
+if (tokenPool.length === 0) {
+  console.warn("[config] No tokens configured! Please add tokens to account.json");
+}
 
 let currentTokenIndex = 0; // 轮询索引
 
@@ -98,7 +105,6 @@ function markTokenSuccess(tokenObj) {
 // 动态模型列表缓存
 let cachedModels = null;
 let cacheTime = 0;
-const CACHE_TTL = 5 * 60 * 1000; // 5分钟缓存
 
 // 短名 -> zo:vendor/name 映射
 let shortNameMap = {};
@@ -928,7 +934,7 @@ app.get("/health", (req, res) => {
 });
 
 // ============ 启动 ============
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || config.port || 3000;
 app.listen(PORT, async () => {
   await refreshModels(); // 启动时预加载模型列表
   console.log(`ZO Proxy running on http://localhost:${PORT}`);
@@ -936,6 +942,8 @@ app.listen(PORT, async () => {
   console.log(`  Anthropic: POST http://localhost:${PORT}/v1/messages`);
   console.log(`  Models:    GET  http://localhost:${PORT}/v1/models`);
   console.log(`Tokens: ${tokenPool.length} loaded, ${tokenPool.filter(t => !t.exhausted).length} available`);
-  console.log(`Available: ${Object.keys(shortNameMap).join(", ")}`);
-  console.log(`Free models: ${cachedModels?.filter(m => m.type === "free").map(m => toShortName(m.model_name)).join(", ")}`);
+  if (tokenPool.length > 0) {
+    console.log(`Available: ${Object.keys(shortNameMap).join(", ")}`);
+    console.log(`Free models: ${cachedModels?.filter(m => m.type === "free").map(m => toShortName(m.model_name)).join(", ")}`);
+  }
 });
