@@ -1,5 +1,6 @@
 node_modules/
 .env
+.env.*
 account.json
-test_*.json
-*.log - 副本.env
+*.log
+.claude/
