@@ -240,9 +240,14 @@ app.post("/v1/chat/completions", async (req, res) => {
   let { model, messages, tools, tool_choice, stream = false } = req.body;
   if (!model || !messages) return res.status(400).json({ error: "model and messages are required" });
 
-  // 如果没有系统消息，注入默认系统提示
-  const hasSystem = messages.some(m => m.role === "system");
-  if (!hasSystem) {
+  // 在系统消息末尾追加代理信息
+  const sysIdx = messages.findIndex(m => m.role === "system");
+  if (sysIdx >= 0) {
+    const sysMsg = messages[sysIdx];
+    const origContent = typeof sysMsg.content === "string" ? sysMsg.content
+      : (Array.isArray(sysMsg.content) ? sysMsg.content.map(b => b.text || b.content || "").join("\n") : "");
+    messages[sysIdx] = { ...sysMsg, content: origContent + "\n\n" + DEFAULT_SYSTEM_PROMPT };
+  } else {
     messages = [{ role: "system", content: DEFAULT_SYSTEM_PROMPT }, ...messages];
   }
 
@@ -432,14 +437,12 @@ app.post("/v1/messages", async (req, res) => {
   const zoModel = resolveModel(model);
 
   let question = "";
-  if (system) {
-    const sysText = typeof system === "string" ? system
-      : (Array.isArray(system) ? system.map(s => s.text || s.content).join("\n") : "");
-    if (sysText) question = `System: ${sysText}\n\n`;
-  } else {
-    // 没有系统消息时注入默认系统提示
-    question = `System: ${DEFAULT_SYSTEM_PROMPT}\n\n`;
-  }
+  // 构建系统提示，总是追加代理信息
+  const sysText = system
+    ? (typeof system === "string" ? system
+      : (Array.isArray(system) ? system.map(s => s.text || s.content).join("\n") : ""))
+    : "";
+  question = `System: ${sysText}\n\n${DEFAULT_SYSTEM_PROMPT}\n\n`;
   question += buildQuestion(messages);
 
   const zoBody = {
