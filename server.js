@@ -15,10 +15,15 @@ let cachedModels = null;
 let cacheTime = 0;
 const CACHE_TTL = 5 * 60 * 1000; // 5分钟缓存
 
+// 默认系统提示词
+const DEFAULT_SYSTEM_PROMPT = "你通过代理服务器运行，所有工具调用都在用户本地系统上执行，而非远程沙箱。请根据工具返回的实际结果来判断环境。";
+
 // 短名 -> zo:vendor/name 映射
 let shortNameMap = {};
 // zo:vendor/name -> 模型详情
 let modelInfoMap = {};
+// 并发刷新去重
+let refreshPromise = null;
 
 function zoHeaders() {
   return {
@@ -56,36 +61,44 @@ async function refreshModels() {
   const now = Date.now();
   if (cachedModels && (now - cacheTime) < CACHE_TTL) return cachedModels;
 
-  try {
-    const resp = await fetch(`${ZO_API}/models/available`, {
-      headers: {
-        "Cookie": `access_token=${ACCESS_TOKEN}`,
-        "X-Zo-Workspace-Origin": ZO_ORIGIN,
-        "Origin": ZO_ORIGIN,
-        "Referer": `${ZO_ORIGIN}/`,
-      },
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
-    cachedModels = data.models;
-    cacheTime = now;
+  // 并发去重：多个请求同时触发刷新时，只发一次 API 调用
+  if (refreshPromise) return refreshPromise;
 
-    // 重建映射
-    shortNameMap = {};
-    modelInfoMap = {};
-    for (const m of data.models) {
-      const short = toShortName(m.model_name);
-      shortNameMap[short] = m.model_name;
-      modelInfoMap[m.model_name] = m;
+  refreshPromise = (async () => {
+    try {
+      const resp = await fetch(`${ZO_API}/models/available`, {
+        headers: {
+          "Cookie": `access_token=${ACCESS_TOKEN}`,
+          "X-Zo-Workspace-Origin": ZO_ORIGIN,
+          "Origin": ZO_ORIGIN,
+          "Referer": `${ZO_ORIGIN}/`,
+        },
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      cachedModels = data.models;
+      cacheTime = now;
+
+      // 重建映射
+      shortNameMap = {};
+      modelInfoMap = {};
+      for (const m of data.models) {
+        const short = toShortName(m.model_name);
+        shortNameMap[short] = m.model_name;
+        modelInfoMap[m.model_name] = m;
+      }
+
+      console.log(`[models] Loaded ${cachedModels.length} models`);
+      return cachedModels;
+    } catch (err) {
+      console.error("[models] Failed to fetch:", err.message);
+      return cachedModels || [];
+    } finally {
+      refreshPromise = null;
     }
+  })();
 
-    console.log(`[models] Loaded ${cachedModels.length} models`);
-    return cachedModels;
-  } catch (err) {
-    console.error("[models] Failed to fetch:", err.message);
-    // 返回缓存或空
-    return cachedModels || [];
-  }
+  return refreshPromise;
 }
 
 // ============ SSE 解析 ============
@@ -224,8 +237,14 @@ app.get("/v1/models", async (req, res) => {
 
 // POST /v1/chat/completions
 app.post("/v1/chat/completions", async (req, res) => {
-  const { model, messages, tools, tool_choice, stream = false } = req.body;
+  let { model, messages, tools, tool_choice, stream = false } = req.body;
   if (!model || !messages) return res.status(400).json({ error: "model and messages are required" });
+
+  // 如果没有系统消息，注入默认系统提示
+  const hasSystem = messages.some(m => m.role === "system");
+  if (!hasSystem) {
+    messages = [{ role: "system", content: DEFAULT_SYSTEM_PROMPT }, ...messages];
+  }
 
   const zoModel = resolveModel(model);
   const question = buildQuestion(messages);
@@ -417,6 +436,9 @@ app.post("/v1/messages", async (req, res) => {
     const sysText = typeof system === "string" ? system
       : (Array.isArray(system) ? system.map(s => s.text || s.content).join("\n") : "");
     if (sysText) question = `System: ${sysText}\n\n`;
+  } else {
+    // 没有系统消息时注入默认系统提示
+    question = `System: ${DEFAULT_SYSTEM_PROMPT}\n\n`;
   }
   question += buildQuestion(messages);
 
