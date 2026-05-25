@@ -185,6 +185,28 @@ function convertToolsToZO(tools, format) {
   }));
 }
 
+/** 将工具定义格式化为文本描述，嵌入 q 字段 */
+function formatToolsAsText(tools, format) {
+  if (!tools || tools.length === 0) return "";
+
+  const toolList = tools.map(t => {
+    const name = format === "openai" ? (t.function?.name || t.name) : t.name;
+    const desc = format === "openai" ? (t.function?.description || t.description || "") : (t.description || "");
+    const params = format === "openai" ? (t.function?.parameters || t.input_schema || {}) : (t.input_schema || {});
+
+    const props = params.properties || {};
+    const required = params.required || [];
+    const paramDescs = Object.entries(props).map(([k, v]) => {
+      const req = required.includes(k) ? " (必填)" : "";
+      return `    - ${k}: ${v.description || v.type || "any"}${req}`;
+    }).join("\n");
+
+    return `- ${name}: ${desc}\n  参数:\n${paramDescs || "    无参数"}`;
+  }).join("\n\n");
+
+  return `\n\n可用工具:\n${toolList}\n\n请使用上述工具完成任务，参数必须严格按照定义的格式。`;
+}
+
 /** 从 ZO 的 FrontendModelResponse 提取 usage，带上 cache */
 function extractUsage(zoResp) {
   const input = zoResp.input_tokens || 0;
@@ -252,7 +274,13 @@ app.post("/v1/chat/completions", async (req, res) => {
   }
 
   const zoModel = resolveModel(model);
-  const question = buildQuestion(messages);
+  let question = buildQuestion(messages);
+
+  // 将工具定义嵌入 q 字段文本，确保模型能看到完整参数定义
+  if (tools && tools.length > 0) {
+    question += formatToolsAsText(tools, "openai");
+    console.log(`[tools] Embedding ${tools.length} tools in question text`);
+  }
 
   const zoBody = {
     q: question,
@@ -263,10 +291,9 @@ app.post("/v1/chat/completions", async (req, res) => {
     stream: true,  // 强制流式，因为 ZO API 总是返回 SSE
   };
 
-  // 尝试传递工具定义给 ZO API
+  // 也传递 tools 字段（ZO 可能会用）
   if (tools && tools.length > 0) {
     zoBody.tools = convertToolsToZO(tools, "openai");
-    console.log(`[tools] Passing ${tools.length} tools to ZO API:`, tools.map(t => t.function?.name || t.name).join(", "));
   }
 
   try {
@@ -445,6 +472,12 @@ app.post("/v1/messages", async (req, res) => {
   question = `System: ${sysText}\n\n${DEFAULT_SYSTEM_PROMPT}\n\n`;
   question += buildQuestion(messages);
 
+  // 将工具定义嵌入 q 字段文本，确保模型能看到完整参数定义
+  if (tools && tools.length > 0) {
+    question += formatToolsAsText(tools, "anthropic");
+    console.log(`[tools] Embedding ${tools.length} tools in question text`);
+  }
+
   const zoBody = {
     q: question,
     context_paths: [],
@@ -454,10 +487,9 @@ app.post("/v1/messages", async (req, res) => {
     stream: true,  // 强制流式，因为 ZO API 总是返回 SSE
   };
 
-  // 尝试传递工具定义给 ZO API
+  // 也传递 tools 字段（ZO 可能会用）
   if (tools && tools.length > 0) {
     zoBody.tools = convertToolsToZO(tools, "anthropic");
-    console.log(`[tools] Passing ${tools.length} tools to ZO API:`, tools.map(t => t.name).join(", "));
   }
 
   try {
