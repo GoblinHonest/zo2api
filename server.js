@@ -65,7 +65,7 @@ function getNextToken() {
   return token;
 }
 
-// 标记 token 额度用完
+// 标记 token 额度用完（402 错误）
 function markTokenExhausted(tokenObj) {
   tokenObj.exhausted = true;
   tokenObj.exhaustedAt = Date.now();
@@ -73,13 +73,11 @@ function markTokenExhausted(tokenObj) {
   console.log(`[token] Token #${tokenObj.index} exhausted (${available} remaining)`);
 }
 
-// 标记 token 失败（非 402 错误）
-function markTokenFailed(tokenObj) {
+// 标记 token 失败（非 402 错误，只记录日志，不累计）
+function markTokenFailed(tokenObj, err) {
   tokenObj.failCount++;
-  if (tokenObj.failCount >= 3) {
-    console.log(`[token] Token #${tokenObj.index} failed ${tokenObj.failCount} times, marking exhausted`);
-    markTokenExhausted(tokenObj);
-  }
+  console.log(`[token] Token #${tokenObj.index} failed (${tokenObj.failCount}): ${err?.message || err}`);
+  // 不再累计失败后自动 exhausted，只有 402 才 exhausted
 }
 
 // 重置 token 失败计数
@@ -403,15 +401,15 @@ app.post("/v1/chat/completions", async (req, res) => {
       }
 
       if (!resp.ok) {
-        const err = await resp.text();
-        markTokenFailed(tokenObj);
-        return res.status(resp.status).json({ error: err });
+        const errText = await resp.text();
+        markTokenFailed(tokenObj, new Error(`HTTP ${resp.status}: ${errText}`));
+        return res.status(resp.status).json({ error: errText });
       }
 
       markTokenSuccess(tokenObj);
       break;
     } catch (err) {
-      markTokenFailed(tokenObj);
+      markTokenFailed(tokenObj, err);
       if (attempt === availableTokens.length - 1) {
         console.error("ZO API error:", err);
         return res.status(500).json({ error: err.message });
@@ -640,15 +638,15 @@ app.post("/v1/messages", async (req, res) => {
       }
 
       if (!resp.ok) {
-        const err = await resp.text();
-        markTokenFailed(tokenObj);
-        return res.status(resp.status).json({ type: "error", error: { message: err } });
+        const errText = await resp.text();
+        markTokenFailed(tokenObj, new Error(`HTTP ${resp.status}: ${errText}`));
+        return res.status(resp.status).json({ type: "error", error: { message: errText } });
       }
 
       markTokenSuccess(tokenObj);
       break;
     } catch (err) {
-      markTokenFailed(tokenObj);
+      markTokenFailed(tokenObj, err);
       if (attempt === availableTokens.length - 1) {
         console.error("ZO API error:", err);
         return res.status(500).json({ type: "error", error: { message: err.message } });
