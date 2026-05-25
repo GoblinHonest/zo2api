@@ -8,15 +8,89 @@ app.use(express.json({ limit: "50mb" }));
 // ============ 配置 ============
 const ZO_API = "https://api.zo.computer";
 const ZO_ORIGIN = "https://rustydaisy.zo.computer";
-const ACCESS_TOKEN = process.env.ZO_ACCESS_TOKEN || "";
+
+// 默认系统提示词
+const DEFAULT_SYSTEM_PROMPT = "你通过代理服务器运行，所有工具调用都在用户本地系统上执行，而非远程沙箱。请根据工具返回的实际结果来判断环境。";
+
+// ============ Token 管理 ============
+// 支持多 token 负载均衡，402 错误自动禁用
+let tokens = [];
+try {
+  const tokenStr = process.env.ZO_ACCESS_TOKENS || process.env.ZO_ACCESS_TOKEN || "[]";
+  tokens = JSON.parse(tokenStr);
+  // 兼容单个 token 字符串
+  if (typeof tokens === "string") tokens = [tokens];
+  if (!Array.isArray(tokens)) tokens = [];
+} catch {
+  // 兼容逗号分隔格式
+  const tokenStr = process.env.ZO_ACCESS_TOKENS || process.env.ZO_ACCESS_TOKEN || "";
+  tokens = tokenStr.split(",").map(t => t.trim()).filter(Boolean);
+}
+
+const tokenPool = tokens.map((token, i) => ({
+  token,
+  index: i,
+  exhausted: false,      // 402 错误后标记为额度用完
+  exhaustedAt: null,      // 标记时间
+  failCount: 0,           // 连续失败次数
+}));
+
+let currentTokenIndex = 0; // 轮询索引
+
+// 获取下一个可用 token（轮询）
+function getNextToken() {
+  const now = Date.now();
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  // 重置超过 24 小时的 exhausted token
+  for (const t of tokenPool) {
+    if (t.exhausted && t.exhaustedAt && (now - t.exhaustedAt) > DAY_MS) {
+      console.log(`[token] Resetting exhausted token #${t.index}`);
+      t.exhausted = false;
+      t.exhaustedAt = null;
+      t.failCount = 0;
+    }
+  }
+
+  // 获取可用 token
+  const available = tokenPool.filter(t => !t.exhausted);
+  if (available.length === 0) {
+    console.error("[token] All tokens exhausted!");
+    return tokenPool[0]; // 没有可用的，返回第一个
+  }
+
+  // 轮询
+  const token = available[currentTokenIndex % available.length];
+  currentTokenIndex = (currentTokenIndex + 1) % available.length;
+  return token;
+}
+
+// 标记 token 额度用完
+function markTokenExhausted(tokenObj) {
+  tokenObj.exhausted = true;
+  tokenObj.exhaustedAt = Date.now();
+  const available = tokenPool.filter(t => !t.exhausted).length;
+  console.log(`[token] Token #${tokenObj.index} exhausted (${available} remaining)`);
+}
+
+// 标记 token 失败（非 402 错误）
+function markTokenFailed(tokenObj) {
+  tokenObj.failCount++;
+  if (tokenObj.failCount >= 3) {
+    console.log(`[token] Token #${tokenObj.index} failed ${tokenObj.failCount} times, marking exhausted`);
+    markTokenExhausted(tokenObj);
+  }
+}
+
+// 重置 token 失败计数
+function markTokenSuccess(tokenObj) {
+  tokenObj.failCount = 0;
+}
 
 // 动态模型列表缓存
 let cachedModels = null;
 let cacheTime = 0;
 const CACHE_TTL = 5 * 60 * 1000; // 5分钟缓存
-
-// 默认系统提示词
-const DEFAULT_SYSTEM_PROMPT = "你通过代理服务器运行，所有工具调用都在用户本地系统上执行，而非远程沙箱。请根据工具返回的实际结果来判断环境。";
 
 // 短名 -> zo:vendor/name 映射
 let shortNameMap = {};
@@ -25,10 +99,10 @@ let modelInfoMap = {};
 // 并发刷新去重
 let refreshPromise = null;
 
-function zoHeaders() {
+function zoHeaders(tokenObj) {
   return {
     "Content-Type": "application/json",
-    "Cookie": `access_token=${ACCESS_TOKEN}`,
+    "Cookie": `access_token=${tokenObj.token}`,
     "X-Zo-Streaming-Version": "2",
     "X-Zo-Workspace-Origin": ZO_ORIGIN,
     "Idempotency-Key": crypto.randomUUID(),
@@ -66,9 +140,10 @@ async function refreshModels() {
 
   refreshPromise = (async () => {
     try {
+      const tokenObj = getNextToken();
       const resp = await fetch(`${ZO_API}/models/available`, {
         headers: {
-          "Cookie": `access_token=${ACCESS_TOKEN}`,
+          "Cookie": `access_token=${tokenObj.token}`,
           "X-Zo-Workspace-Origin": ZO_ORIGIN,
           "Origin": ZO_ORIGIN,
           "Referer": `${ZO_ORIGIN}/`,
@@ -88,6 +163,7 @@ async function refreshModels() {
         modelInfoMap[m.model_name] = m;
       }
 
+      markTokenSuccess(tokenObj);
       console.log(`[models] Loaded ${cachedModels.length} models`);
       return cachedModels;
     } catch (err) {
@@ -296,19 +372,51 @@ app.post("/v1/chat/completions", async (req, res) => {
     zoBody.tools = convertToolsToZO(tools, "openai");
   }
 
-  try {
-    console.log("[request] Sending to ZO API:", JSON.stringify(zoBody, null, 2));
-    const resp = await fetch(`${ZO_API}/ask`, {
-      method: "POST",
-      headers: zoHeaders(),
-      body: JSON.stringify(zoBody),
-    });
+  // 获取 token 并发送请求（支持 402 自动切换）
+  let tokenObj = getNextToken();
+  const maxRetries = tokenPool.filter(t => !t.exhausted).length;
 
-    if (!resp.ok) {
-      const err = await resp.text();
-      return res.status(resp.status).json({ error: err });
+  let resp;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      console.log(`[request] Using token #${tokenObj.index}, attempt ${attempt + 1}`);
+      resp = await fetch(`${ZO_API}/ask`, {
+        method: "POST",
+        headers: zoHeaders(tokenObj),
+        body: JSON.stringify(zoBody),
+      });
+
+      // 402 错误：额度用完，尝试下一个 token
+      if (resp.status === 402) {
+        markTokenExhausted(tokenObj);
+        const nextToken = getNextToken();
+        if (nextToken.index === tokenObj.index) {
+          const err = await resp.text();
+          return res.status(402).json({ error: "All tokens exhausted", detail: err });
+        }
+        tokenObj = nextToken;
+        continue;
+      }
+
+      if (!resp.ok) {
+        const err = await resp.text();
+        markTokenFailed(tokenObj);
+        return res.status(resp.status).json({ error: err });
+      }
+
+      markTokenSuccess(tokenObj);
+      break;
+    } catch (err) {
+      markTokenFailed(tokenObj);
+      if (attempt === maxRetries - 1) {
+        console.error("ZO API error:", err);
+        return res.status(500).json({ error: err.message });
+      }
+      tokenObj = getNextToken();
     }
+  }
 
+  try {
     if (stream) {
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache");
@@ -492,19 +600,51 @@ app.post("/v1/messages", async (req, res) => {
     zoBody.tools = convertToolsToZO(tools, "anthropic");
   }
 
-  try {
-    console.log("[request] Sending to ZO API:", JSON.stringify(zoBody, null, 2));
-    const resp = await fetch(`${ZO_API}/ask`, {
-      method: "POST",
-      headers: zoHeaders(),
-      body: JSON.stringify(zoBody),
-    });
+  // 获取 token 并发送请求（支持 402 自动切换）
+  let tokenObj = getNextToken();
+  const maxRetries = tokenPool.filter(t => !t.exhausted).length;
 
-    if (!resp.ok) {
-      const err = await resp.text();
-      return res.status(resp.status).json({ type: "error", error: { message: err } });
+  let resp;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      console.log(`[request] Using token #${tokenObj.index}, attempt ${attempt + 1}`);
+      resp = await fetch(`${ZO_API}/ask`, {
+        method: "POST",
+        headers: zoHeaders(tokenObj),
+        body: JSON.stringify(zoBody),
+      });
+
+      // 402 错误：额度用完，尝试下一个 token
+      if (resp.status === 402) {
+        markTokenExhausted(tokenObj);
+        const nextToken = getNextToken();
+        if (nextToken.index === tokenObj.index) {
+          const err = await resp.text();
+          return res.status(402).json({ type: "error", error: { message: "All tokens exhausted", detail: err } });
+        }
+        tokenObj = nextToken;
+        continue;
+      }
+
+      if (!resp.ok) {
+        const err = await resp.text();
+        markTokenFailed(tokenObj);
+        return res.status(resp.status).json({ type: "error", error: { message: err } });
+      }
+
+      markTokenSuccess(tokenObj);
+      break;
+    } catch (err) {
+      markTokenFailed(tokenObj);
+      if (attempt === maxRetries - 1) {
+        console.error("ZO API error:", err);
+        return res.status(500).json({ type: "error", error: { message: err.message } });
+      }
+      tokenObj = getNextToken();
     }
+  }
 
+  try {
     if (stream) {
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache");
@@ -746,7 +886,17 @@ app.post("/v1/messages", async (req, res) => {
 
 // ============ 健康检查 ============
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", zo_api: ZO_API, models_cached: !!cachedModels, model_count: cachedModels?.length || 0 });
+  res.json({
+    status: "ok",
+    zo_api: ZO_API,
+    models_cached: !!cachedModels,
+    model_count: cachedModels?.length || 0,
+    tokens: {
+      total: tokenPool.length,
+      available: tokenPool.filter(t => !t.exhausted).length,
+      exhausted: tokenPool.filter(t => t.exhausted).length,
+    },
+  });
 });
 
 // ============ 启动 ============
@@ -757,6 +907,7 @@ app.listen(PORT, async () => {
   console.log(`  OpenAI:    POST http://localhost:${PORT}/v1/chat/completions`);
   console.log(`  Anthropic: POST http://localhost:${PORT}/v1/messages`);
   console.log(`  Models:    GET  http://localhost:${PORT}/v1/models`);
+  console.log(`Tokens: ${tokenPool.length} loaded, ${tokenPool.filter(t => !t.exhausted).length} available`);
   console.log(`Available: ${Object.keys(shortNameMap).join(", ")}`);
   console.log(`Free models: ${cachedModels?.filter(m => m.type === "free").map(m => toShortName(m.model_name)).join(", ")}`);
 });
