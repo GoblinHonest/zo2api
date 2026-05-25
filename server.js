@@ -3,7 +3,7 @@ import express from "express";
 import crypto from "crypto";
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
 
 // ============ 配置 ============
 const ZO_API = "https://api.zo.computer";
@@ -127,9 +127,49 @@ async function* parseZoSse(reader, decoder) {
 
 function buildQuestion(messages) {
   return messages.map(m => {
+    // Handle tool_result messages specially
+    if (m.role === "tool") {
+      return `tool_result: ${m.content}`;
+    }
+    // Handle tool_use content blocks (Anthropic format)
+    if (Array.isArray(m.content)) {
+      const parts = m.content.map(block => {
+        if (block.type === "tool_result") {
+          return `tool_result (${block.tool_use_id}): ${block.content || ""}`;
+        }
+        if (block.type === "tool_use") {
+          return `tool_call: ${block.name}(${JSON.stringify(block.input)})`;
+        }
+        if (block.type === "text") {
+          return block.text;
+        }
+        return JSON.stringify(block);
+      }).join("\n");
+      return `${m.role}: ${parts}`;
+    }
     const c = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
     return `${m.role}: ${c}`;
   }).join("\n");
+}
+
+/** 将 OpenAI/Anthropic 格式的 tools 转换为 ZO 可能接受的格式 */
+function convertToolsToZO(tools, format) {
+  if (!tools || tools.length === 0) return [];
+
+  if (format === "openai") {
+    return tools.map(t => ({
+      name: t.function?.name || t.name,
+      description: t.function?.description || t.description || "",
+      parameters: t.function?.parameters || t.input_schema || {},
+    }));
+  }
+
+  // Anthropic format
+  return tools.map(t => ({
+    name: t.name,
+    description: t.description || "",
+    parameters: t.input_schema || {},
+  }));
 }
 
 /** 从 ZO 的 FrontendModelResponse 提取 usage，带上 cache */
@@ -184,7 +224,7 @@ app.get("/v1/models", async (req, res) => {
 
 // POST /v1/chat/completions
 app.post("/v1/chat/completions", async (req, res) => {
-  const { model, messages, stream = false } = req.body;
+  const { model, messages, tools, tool_choice, stream = false } = req.body;
   if (!model || !messages) return res.status(400).json({ error: "model and messages are required" });
 
   const zoModel = resolveModel(model);
@@ -196,9 +236,17 @@ app.post("/v1/chat/completions", async (req, res) => {
     command_paths: [],
     model_name: zoModel,
     expanded_paths: ["Articles", "Images"],
+    stream: true,  // 强制流式，因为 ZO API 总是返回 SSE
   };
 
+  // 尝试传递工具定义给 ZO API
+  if (tools && tools.length > 0) {
+    zoBody.tools = convertToolsToZO(tools, "openai");
+    console.log(`[tools] Passing ${tools.length} tools to ZO API:`, tools.map(t => t.function?.name || t.name).join(", "));
+  }
+
   try {
+    console.log("[request] Sending to ZO API:", JSON.stringify(zoBody, null, 2));
     const resp = await fetch(`${ZO_API}/ask`, {
       method: "POST",
       headers: zoHeaders(),
@@ -218,8 +266,62 @@ app.post("/v1/chat/completions", async (req, res) => {
 
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
+      let toolCalls = [];
+      let currentToolCall = null;
 
       for await (const { sseEvent, data } of parseZoSse(reader, decoder)) {
+        console.log("[sse]", sseEvent, data.part?.part_kind || data.delta?.part_delta_kind || "");
+
+        // Handle tool-call PartStartEvent (ZO uses "tool-call" with hyphen)
+        if (sseEvent === "PartStartEvent" && data.part?.part_kind === "tool-call") {
+          currentToolCall = {
+            id: data.part.tool_call_id || "call_" + uid(),
+            type: "function",
+            function: { name: data.part.tool_name, arguments: "" },
+          };
+          toolCalls.push(currentToolCall);
+          res.write(`data: ${JSON.stringify({
+            id: "chatcmpl-" + uid(),
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [{ index: 0, delta: { tool_calls: [{ index: toolCalls.length - 1, id: currentToolCall.id, type: "function", function: { name: currentToolCall.function.name, arguments: "" } }] }, finish_reason: null }],
+          })}\n\n`);
+          continue;
+        }
+
+        // Handle tool_call PartDeltaEvent (ZO uses "tool_call" with underscore)
+        if (sseEvent === "PartDeltaEvent" && data.delta?.part_delta_kind === "tool_call" && currentToolCall) {
+          const argsDelta = data.delta.args_delta || "";
+          currentToolCall.function.arguments += argsDelta;
+          res.write(`data: ${JSON.stringify({
+            id: "chatcmpl-" + uid(),
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [{ index: 0, delta: { tool_calls: [{ index: toolCalls.length - 1, function: { arguments: argsDelta } }] }, finish_reason: null }],
+          })}\n\n`);
+          continue;
+        }
+
+        // Handle FunctionToolCallEvent (complete tool call with validated args)
+        if (sseEvent === "FunctionToolCallEvent") {
+          const tc = data.part;
+          // Update or add the tool call
+          const existing = toolCalls.find(t => t.id === tc.tool_call_id);
+          if (existing) {
+            existing.function.arguments = tc.args || "{}";
+          } else {
+            toolCalls.push({
+              id: tc.tool_call_id || "call_" + uid(),
+              type: "function",
+              function: { name: tc.tool_name, arguments: tc.args || "{}" },
+            });
+          }
+          continue;
+        }
+
+        // Handle text content
         let delta = null;
         if (sseEvent === "PartDeltaEvent" && data.delta?.part_delta_kind === "text") delta = data.delta.content_delta;
         if (sseEvent === "PartStartEvent" && data.part?.part_kind === "text" && data.part.content) delta = data.part.content;
@@ -234,12 +336,17 @@ app.post("/v1/chat/completions", async (req, res) => {
         }
       }
 
+      const finishReason = toolCalls.length > 0 ? "tool_calls" : "stop";
+      const finalDelta = toolCalls.length > 0
+        ? { tool_calls: toolCalls.map((tc, i) => ({ index: i, ...tc })) }
+        : {};
+
       res.write(`data: ${JSON.stringify({
         id: "chatcmpl-" + uid(),
         object: "chat.completion.chunk",
         created: Math.floor(Date.now() / 1000),
         model,
-        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        choices: [{ index: 0, delta: finalDelta, finish_reason: finishReason }],
       })}\n\n`);
       res.write("data: [DONE]\n\n");
       res.end();
@@ -248,16 +355,38 @@ app.post("/v1/chat/completions", async (req, res) => {
       const decoder = new TextDecoder();
       let fullText = "";
       let zoUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+      let toolCalls = [];
 
       for await (const { sseEvent, data } of parseZoSse(reader, decoder)) {
+        console.log("[sse]", sseEvent, data.part?.part_kind || data.delta?.part_delta_kind || "");
+
         if (sseEvent === "FrontendModelResponse") {
           zoUsage = extractUsage(data);
           const textParts = (data.parts || []).filter(p => p.part_kind === "text");
           if (textParts.length > 0) fullText = textParts.map(p => p.content).join("\n");
         }
+
+        // Handle FunctionToolCallEvent (complete tool call)
+        if (sseEvent === "FunctionToolCallEvent") {
+          const tc = data.part;
+          toolCalls.push({
+            id: tc.tool_call_id || "call_" + uid(),
+            type: "function",
+            function: {
+              name: tc.tool_name,
+              arguments: tc.args || "{}",
+            },
+          });
+        }
+
         if (sseEvent === "PartEndEvent" && data.part?.part_kind === "text" && data.part.content) {
           fullText = fullText || data.part.content;
         }
+      }
+
+      const message = { role: "assistant", content: fullText || null };
+      if (toolCalls.length > 0) {
+        message.tool_calls = toolCalls;
       }
 
       res.json({
@@ -265,7 +394,7 @@ app.post("/v1/chat/completions", async (req, res) => {
         object: "chat.completion",
         created: Math.floor(Date.now() / 1000),
         model,
-        choices: [{ index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop" }],
+        choices: [{ index: 0, message, finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop" }],
         usage: buildOpenAIUsage(zoUsage),
       });
     }
@@ -278,7 +407,7 @@ app.post("/v1/chat/completions", async (req, res) => {
 // ============ Anthropic Messages 兼容接口 ============
 
 app.post("/v1/messages", async (req, res) => {
-  const { model, messages, system, stream = false } = req.body;
+  const { model, messages, system, tools, tool_choice, stream = false } = req.body;
   if (!model || !messages) return res.status(400).json({ type: "error", error: { message: "model and messages are required" } });
 
   const zoModel = resolveModel(model);
@@ -297,9 +426,17 @@ app.post("/v1/messages", async (req, res) => {
     command_paths: [],
     model_name: zoModel,
     expanded_paths: ["Articles", "Images"],
+    stream: true,  // 强制流式，因为 ZO API 总是返回 SSE
   };
 
+  // 尝试传递工具定义给 ZO API
+  if (tools && tools.length > 0) {
+    zoBody.tools = convertToolsToZO(tools, "anthropic");
+    console.log(`[tools] Passing ${tools.length} tools to ZO API:`, tools.map(t => t.name).join(", "));
+  }
+
   try {
+    console.log("[request] Sending to ZO API:", JSON.stringify(zoBody, null, 2));
     const resp = await fetch(`${ZO_API}/ask`, {
       method: "POST",
       headers: zoHeaders(),
@@ -322,10 +459,6 @@ app.post("/v1/messages", async (req, res) => {
         type: "message_start",
         message: { id: msgId, type: "message", role: "assistant", content: [], model, usage: { input_tokens: 0, output_tokens: 0 } },
       })}\n\n`);
-      res.write(`event: content_block_start\ndata: ${JSON.stringify({
-        type: "content_block_start", index: 0,
-        content_block: { type: "text", text: "" },
-      })}\n\n`);
 
       // keepalive: Anthropic SDK 接受 comment 行做心跳
       const keepalive = setInterval(() => res.write(": heartbeat\n\n"), 5000);
@@ -333,27 +466,171 @@ app.post("/v1/messages", async (req, res) => {
       const decoder = new TextDecoder();
 
       let zoUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+      let contentBlocks = []; // track all blocks for final stop_reason
+      let blockIndex = 0; // monotonically increasing index
+      let currentBlockType = null; // "text" or "tool_use" or null
+      let currentToolUse = null;
+      let textStarted = false;
+      let textClosed = false;
+
+      // Helper: close current block if open
+      function closeCurrentBlock() {
+        if (currentBlockType === "text" && textStarted && !textClosed) {
+          res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIndex - 1 })}\n\n`);
+          textClosed = true;
+        }
+        if (currentBlockType === "tool_use" && currentToolUse) {
+          // Parse accumulated input
+          if (typeof currentToolUse.input === "string") {
+            try { currentToolUse.input = JSON.parse(currentToolUse.input); } catch { currentToolUse.input = {}; }
+          }
+          res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIndex - 1 })}\n\n`);
+          currentToolUse = null;
+        }
+        currentBlockType = null;
+      }
 
       for await (const { sseEvent, data } of parseZoSse(reader, decoder)) {
+        console.log("[sse]", sseEvent, data.part?.part_kind || data.delta?.part_delta_kind || "");
+
         if (sseEvent === "FrontendModelResponse") {
           zoUsage = extractUsage(data);
         }
-        let delta = null;
-        if (sseEvent === "PartDeltaEvent" && data.delta?.part_delta_kind === "text") delta = data.delta.content_delta;
-        if (sseEvent === "PartStartEvent" && data.part?.part_kind === "text" && data.part.content) delta = data.part.content;
-        if (delta) {
+
+        // Handle text PartStartEvent
+        if (sseEvent === "PartStartEvent" && data.part?.part_kind === "text") {
+          if (!textStarted) {
+            closeCurrentBlock();
+            res.write(`event: content_block_start\ndata: ${JSON.stringify({
+              type: "content_block_start", index: blockIndex,
+              content_block: { type: "text", text: "" },
+            })}\n\n`);
+            textStarted = true;
+            textClosed = false;
+            currentBlockType = "text";
+            blockIndex++;
+          }
+          continue;
+        }
+
+        // Handle text PartDeltaEvent
+        if (sseEvent === "PartDeltaEvent" && data.delta?.part_delta_kind === "text") {
+          if (currentBlockType !== "text") {
+            closeCurrentBlock();
+            res.write(`event: content_block_start\ndata: ${JSON.stringify({
+              type: "content_block_start", index: blockIndex,
+              content_block: { type: "text", text: "" },
+            })}\n\n`);
+            textStarted = true;
+            textClosed = false;
+            currentBlockType = "text";
+            blockIndex++;
+          }
           res.write(`event: content_block_delta\ndata: ${JSON.stringify({
-            type: "content_block_delta", index: 0,
-            delta: { type: "text_delta", text: delta },
+            type: "content_block_delta", index: blockIndex - 1,
+            delta: { type: "text_delta", text: data.delta.content_delta || "" },
           })}\n\n`);
+          continue;
+        }
+
+        // Handle text PartEndEvent
+        if (sseEvent === "PartEndEvent" && data.part?.part_kind === "text") {
+          if (currentBlockType === "text" && !textClosed) {
+            res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIndex - 1 })}\n\n`);
+            textClosed = true;
+            currentBlockType = null;
+          }
+          continue;
+        }
+
+        // Handle tool-call PartStartEvent (ZO uses "tool-call" with hyphen)
+        if (sseEvent === "PartStartEvent" && data.part?.part_kind === "tool-call") {
+          closeCurrentBlock();
+          currentToolUse = {
+            type: "tool_use",
+            id: data.part.tool_call_id || "toolu_" + uid(),
+            name: data.part.tool_name,
+            input: "",
+          };
+          contentBlocks.push(currentToolUse);
+          currentBlockType = "tool_use";
+
+          res.write(`event: content_block_start\ndata: ${JSON.stringify({
+            type: "content_block_start", index: blockIndex,
+            content_block: { type: "tool_use", id: currentToolUse.id, name: currentToolUse.name, input: {} },
+          })}\n\n`);
+          blockIndex++;
+          continue;
+        }
+
+        // Handle tool_call PartDeltaEvent (ZO uses "tool_call" with underscore)
+        if (sseEvent === "PartDeltaEvent" && data.delta?.part_delta_kind === "tool_call" && currentToolUse) {
+          const argsDelta = data.delta.args_delta || "";
+          currentToolUse.input += argsDelta;
+          res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+            type: "content_block_delta", index: blockIndex - 1,
+            delta: { type: "input_json_delta", partial_json: argsDelta },
+          })}\n\n`);
+          continue;
+        }
+
+        // Handle FunctionToolCallEvent (complete tool call with validated args)
+        if (sseEvent === "FunctionToolCallEvent") {
+          const tc = data.part;
+          if (currentToolUse && currentToolUse.id === tc.tool_call_id) {
+            // Update existing tool call
+            currentToolUse.input = tc.args || "{}";
+          } else {
+            // New tool call not started by PartStartEvent
+            closeCurrentBlock();
+            currentToolUse = {
+              type: "tool_use",
+              id: tc.tool_call_id || "toolu_" + uid(),
+              name: tc.tool_name,
+              input: tc.args || "{}",
+            };
+            contentBlocks.push(currentToolUse);
+            currentBlockType = "tool_use";
+
+            res.write(`event: content_block_start\ndata: ${JSON.stringify({
+              type: "content_block_start", index: blockIndex,
+              content_block: { type: "tool_use", id: currentToolUse.id, name: currentToolUse.name, input: {} },
+            })}\n\n`);
+            blockIndex++;
+
+            // Send the full input as delta
+            res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+              type: "content_block_delta", index: blockIndex - 1,
+              delta: { type: "input_json_delta", partial_json: currentToolUse.input },
+            })}\n\n`);
+          }
+          continue;
+        }
+
+        // Handle tool-call PartEndEvent
+        if (sseEvent === "PartEndEvent" && data.part?.part_kind === "tool-call") {
+          if (currentBlockType === "tool_use" && currentToolUse) {
+            // Parse the accumulated input
+            if (typeof currentToolUse.input === "string") {
+              try { currentToolUse.input = JSON.parse(currentToolUse.input); } catch { currentToolUse.input = {}; }
+            }
+            res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIndex - 1 })}\n\n`);
+            currentToolUse = null;
+            currentBlockType = null;
+          }
+          continue;
         }
       }
 
       clearInterval(keepalive);
-      res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`);
+
+      // Close any remaining open block
+      closeCurrentBlock();
+
+      const stopReason = contentBlocks.length > 0 ? "tool_use" : "end_turn";
       res.write(`event: message_delta\ndata: ${JSON.stringify({
         type: "message_delta",
-        delta: { stop_reason: "end_turn", stop_sequence: null },
+        delta: { stop_reason: stopReason, stop_sequence: null },
         usage: { output_tokens: zoUsage.output },
       })}\n\n`);
       res.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
@@ -363,25 +640,44 @@ app.post("/v1/messages", async (req, res) => {
       const decoder = new TextDecoder();
       let fullText = "";
       let zoUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+      let toolUses = [];
 
       for await (const { sseEvent, data } of parseZoSse(reader, decoder)) {
+        console.log("[sse]", sseEvent, data.part?.part_kind || data.delta?.part_delta_kind || "");
+
         if (sseEvent === "FrontendModelResponse") {
           zoUsage = extractUsage(data);
           const textParts = (data.parts || []).filter(p => p.part_kind === "text");
           if (textParts.length > 0) fullText = textParts.map(p => p.content).join("\n");
         }
+
+        // Handle FunctionToolCallEvent (complete tool call)
+        if (sseEvent === "FunctionToolCallEvent") {
+          const tc = data.part;
+          toolUses.push({
+            type: "tool_use",
+            id: tc.tool_call_id || "toolu_" + uid(),
+            name: tc.tool_name,
+            input: typeof tc.args === "string" ? JSON.parse(tc.args) : (tc.args || {}),
+          });
+        }
+
         if (sseEvent === "PartEndEvent" && data.part?.part_kind === "text" && data.part.content) {
           fullText = fullText || data.part.content;
         }
       }
 
+      const content = [];
+      if (fullText) content.push({ type: "text", text: fullText });
+      content.push(...toolUses);
+
       res.json({
         id: "msg_" + uid(),
         type: "message",
         role: "assistant",
-        content: [{ type: "text", text: fullText }],
+        content,
         model,
-        stop_reason: "end_turn",
+        stop_reason: toolUses.length > 0 ? "tool_use" : "end_turn",
         usage: buildAnthropicUsage(zoUsage),
       });
     }
