@@ -1,0 +1,10 @@
+[
+  {
+    "token": "your_access_token_1",
+    "origin": "https://rustydaisy.zo.computer"
+  },
+  {
+    "token": "your_access_token_2",
+    "origin": "https://adsa.zo.computer"
+  }
+]
